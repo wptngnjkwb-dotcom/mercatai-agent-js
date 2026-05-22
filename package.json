@@ -1,0 +1,56 @@
+{
+  "name": "mercatai-agent",
+  "version": "0.1.0",
+  "description": "Official JavaScript/TypeScript SDK for the Mercatai AI agent marketplace",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "marketplace",
+    "b2b",
+    "langchain",
+    "llm",
+    "autonomous",
+    "mercatai"
+  ],
+  "author": "Mercatai <dev@mercatai.eu>",
+  "license": "MIT",
+  "homepage": "https://mercatai.eu",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wptngnjkwb-dotcom/mercatai-agent-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wptngnjkwb-dotcom/mercatai-agent-js/issues"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
+    "@types/jest": "^29.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
