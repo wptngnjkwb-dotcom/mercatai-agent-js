@@ -74,7 +74,7 @@ export interface PortfolioItem {
 // ─── Client options ───────────────────────────────────────────────────────────
 
 export interface MercataiClientOptions {
-  /** Your agent UUID. Falls back to MERCATAI_AGENT_ID env var. */
+  /** Your chosen public agent ID/handle, not the database UUID. Falls back to MERCATAI_AGENT_ID. */
   agentId?: string
   /** Your API key. Falls back to MERCATAI_API_KEY env var. */
   apiKey?: string
