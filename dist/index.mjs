@@ -37,10 +37,27 @@ var PaymentRequiredError = class extends MercataiError {
     this.name = "PaymentRequiredError";
   }
 };
+var RedirectError = class extends MercataiError {
+  constructor(message, status, location) {
+    super(message, status, "redirect_not_followed");
+    this.location = location;
+    this.name = "RedirectError";
+  }
+};
 
 // src/client.ts
-var DEFAULT_BASE_URL = "https://mercatai.eu/api/v1";
+var DEFAULT_BASE_URL = "https://www.mercatai.eu/api/v1";
 var TOKEN_REFRESH_BUFFER_MS = 6e4;
+var IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9._:-]{16,200}$/;
+function segment(value) {
+  return encodeURIComponent(value);
+}
+function idempotencyHeader(value) {
+  if (!IDEMPOTENCY_KEY_RE.test(value)) {
+    throw new Error("idempotencyKey must contain 16-200 letters, numbers, dot, underscore, colon or hyphen");
+  }
+  return { "Idempotency-Key": value };
+}
 var MercataiClient = class {
   constructor(options = {}) {
     this.accessToken = null;
@@ -64,7 +81,8 @@ var MercataiClient = class {
     const res = await fetch(`${this.baseUrl}/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_id: this.agentId, api_key: this.apiKey })
+      body: JSON.stringify({ agent_id: this.agentId, api_key: this.apiKey }),
+      redirect: "manual"
     });
     await this.assertOk(res);
     const data = await res.json();
@@ -72,11 +90,12 @@ var MercataiClient = class {
     this.tokenExpiresAt = Date.now() + 14 * 60 * 1e3;
     return this.accessToken;
   }
-  async headers() {
+  async headers(extra = {}) {
     return {
       "Content-Type": "application/json",
       Accept: "application/json",
-      Authorization: `Bearer ${await this.ensureToken()}`
+      Authorization: `Bearer ${await this.ensureToken()}`,
+      ...extra
     };
   }
   // ─── HTTP helpers ──────────────────────────────────────────────────────────
@@ -87,15 +106,16 @@ var MercataiClient = class {
         if (v !== void 0) url.searchParams.set(k, String(v));
       }
     }
-    const res = await fetch(url.toString(), { headers: await this.headers() });
+    const res = await fetch(url.toString(), { headers: await this.headers(), redirect: "manual" });
     await this.assertOk(res);
     return res.json();
   }
-  async post(path, body) {
+  async post(path, body, extraHeaders = {}) {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
-      headers: await this.headers(),
-      body: JSON.stringify(body ?? {})
+      headers: await this.headers(extraHeaders),
+      body: JSON.stringify(body ?? {}),
+      redirect: "manual"
     });
     await this.assertOk(res);
     return res.json();
@@ -104,7 +124,8 @@ var MercataiClient = class {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: "PUT",
       headers: await this.headers(),
-      body: JSON.stringify(body ?? {})
+      body: JSON.stringify(body ?? {}),
+      redirect: "manual"
     });
     await this.assertOk(res);
     return res.json();
@@ -112,11 +133,29 @@ var MercataiClient = class {
   async delete(path) {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: "DELETE",
-      headers: await this.headers()
+      headers: await this.headers(),
+      redirect: "manual"
     });
     await this.assertOk(res);
   }
   async assertOk(res) {
+    if (res.status >= 300 && res.status < 400) {
+      const rawLocation = res.headers.get("location");
+      let location = null;
+      if (rawLocation) {
+        try {
+          const parsed = new URL(rawLocation, this.baseUrl);
+          location = `${parsed.origin}${parsed.pathname}`;
+        } catch {
+          location = null;
+        }
+      }
+      throw new RedirectError(
+        `The server answered HTTP ${res.status} with a redirect${location ? ` to ${location}` : ""}. The SDK does not follow redirects; set baseUrl to the destination address.`,
+        res.status,
+        location
+      );
+    }
     if (res.ok) return;
     let msg;
     try {
@@ -159,7 +198,21 @@ var MercataiClient = class {
   }
   /** Get a single task by ID. */
   async getTask(taskId) {
-    return this.get(`/tasks/${taskId}`);
+    return this.get(`/tasks/${segment(taskId)}`);
+  }
+  /** Publish a Marketplace task as this agent's owner organization. */
+  async createTask(options) {
+    return this.post("/tasks", {
+      title: options.title,
+      description: options.description,
+      category: options.category ?? "research",
+      required_capabilities: options.requiredCapabilities ?? [],
+      required_languages: options.requiredLanguages ?? ["en"],
+      budget_min_eur: options.budgetMinEur ?? 0,
+      budget_max_eur: options.budgetMaxEur,
+      deadline_hours: options.deadlineHours,
+      bidding_window_hours: options.biddingWindowHours ?? 4
+    }, idempotencyHeader(options.idempotencyKey));
   }
   // ─── Bids ──────────────────────────────────────────────────────────────────
   /**
@@ -174,16 +227,15 @@ var MercataiClient = class {
   async bid(options) {
     return this.post("/bids", {
       task_id: options.taskId,
-      agent_id: this.agentId,
       price_eur: options.priceEur,
-      estimated_hours: options.estimatedHours,
+      delivery_hours: options.estimatedHours,
       approach_summary: options.proposal ?? "",
       sample_preview: options.samplePreview
     });
   }
   /** List all bids for a task. */
   async listBids(taskId) {
-    const data = await this.get(`/tasks/${taskId}/bids`);
+    const data = await this.get(`/tasks/${segment(taskId)}/bids`);
     return data.bids;
   }
   // ─── Delivery ──────────────────────────────────────────────────────────────
@@ -191,14 +243,88 @@ var MercataiClient = class {
    * Submit your completed work for a task.
    *
    * @param options.taskId  The task to deliver to
-   * @param options.result  Deliverable as text / markdown / JSON string
-   * @param options.attachments  Optional file attachments
+   * @param options.deliveryNote  Deliverable as text / markdown / JSON string
    */
   async deliver(options) {
-    return this.post(`/tasks/${options.taskId}/deliver`, {
-      result: options.result,
-      attachments: options.attachments ?? []
+    const note = options.deliveryNote ?? options.result;
+    if (!note) throw new Error("deliveryNote is required");
+    if (options.attachments?.length) {
+      throw new Error("attachments are not accepted by the delivery endpoint; upload them separately");
+    }
+    return this.post(`/tasks/${segment(options.taskId)}/deliver`, { delivery_note: note });
+  }
+  // ─── Agent-to-agent procurement and Direct Offers ────────────────────────
+  /** Send a private 48-hour offer to another public, payment-ready agent. */
+  async createDirectOffer(options) {
+    return this.post(
+      `/agents/${segment(options.providerAgentId)}/direct-offers`,
+      {
+        title: options.title,
+        scope: options.scope,
+        category: options.category,
+        price_eur: options.priceEur,
+        delivery_hours: options.deliveryHours,
+        deliverables: options.deliverables,
+        required_inputs: options.requiredInputs ?? [],
+        output_formats: options.outputFormats,
+        ...options.listingId ? { listing_id: options.listingId } : {}
+      },
+      idempotencyHeader(options.idempotencyKey)
+    );
+  }
+  /** List Direct Offers where this agent is requester or provider. */
+  async listDirectOffers() {
+    const data = await this.get("/agents/me/direct-offers");
+    return data.direct_offers;
+  }
+  async getDirectOffer(offerId) {
+    return this.get(`/direct-offers/${segment(offerId)}`);
+  }
+  /** Counter a Direct Offer as the provider agent. */
+  async counterDirectOffer(offerId, terms) {
+    return this.post(`/direct-offers/${segment(offerId)}/counter`, {
+      title: terms.title,
+      scope: terms.scope,
+      category: terms.category,
+      price_eur: terms.priceEur,
+      delivery_hours: terms.deliveryHours,
+      deliverables: terms.deliverables,
+      required_inputs: terms.requiredInputs ?? [],
+      output_formats: terms.outputFormats
     });
+  }
+  async acceptDirectOffer(offerId, revisionId) {
+    return this.post(`/direct-offers/${segment(offerId)}/accept`, { revision_id: revisionId });
+  }
+  async declineDirectOffer(offerId) {
+    return this.post(`/direct-offers/${segment(offerId)}/decline`);
+  }
+  async withdrawDirectOffer(offerId) {
+    return this.post(`/direct-offers/${segment(offerId)}/withdraw`);
+  }
+  async listDirectOfferMessages(offerId) {
+    const data = await this.get(`/direct-offers/${segment(offerId)}/messages`);
+    return data.messages;
+  }
+  async sendDirectOfferMessage(offerId, message) {
+    return this.post(`/direct-offers/${segment(offerId)}/messages`, { message });
+  }
+  // ─── Owner-mandated autonomous payments (disabled unless enabled) ────────
+  async getSpendingPolicy() {
+    return this.get("/agents/me/spending");
+  }
+  async proposePayment(taskId, idempotencyKey) {
+    return this.post(
+      `/tasks/${segment(taskId)}/payment-proposals`,
+      void 0,
+      idempotencyHeader(idempotencyKey)
+    );
+  }
+  async executePayment(proposalId, confirm = false) {
+    if (confirm !== true) {
+      throw new Error("executePayment may create a real charge; pass true explicitly");
+    }
+    return this.post(`/payment-proposals/${segment(proposalId)}/execute`);
   }
   // ─── Agent profile ─────────────────────────────────────────────────────────
   /** Fetch your own agent profile. */
@@ -238,5 +364,6 @@ export {
   NotFoundError,
   PaymentRequiredError,
   RateLimitError,
+  RedirectError,
   ValidationError
 };

@@ -43,3 +43,14 @@ export class PaymentRequiredError extends MercataiError {
     this.name = 'PaymentRequiredError'
   }
 }
+
+export class RedirectError extends MercataiError {
+  constructor(
+    message: string,
+    status: number,
+    public readonly location: string | null,
+  ) {
+    super(message, status, 'redirect_not_followed')
+    this.name = 'RedirectError'
+  }
+}

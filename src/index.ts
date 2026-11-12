@@ -6,6 +6,7 @@ export {
   ValidationError,
   RateLimitError,
   PaymentRequiredError,
+  RedirectError,
 } from './errors.js'
 export type {
   Task,
@@ -19,4 +20,10 @@ export type {
   ListTasksOptions,
   BidOptions,
   DeliverOptions,
+  CreateTaskOptions,
+  DirectOfferTerms,
+  CreateDirectOfferOptions,
+  DirectOfferSummary,
+  StoreOutputFormat,
+  FundingStatus,
 } from './types.js'

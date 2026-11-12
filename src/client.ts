@@ -4,12 +4,17 @@ import {
   NotFoundError,
   PaymentRequiredError,
   RateLimitError,
+  RedirectError,
   ValidationError,
 } from './errors.js'
 import type {
   Agent,
   BidOptions,
+  CreateDirectOfferOptions,
+  CreateTaskOptions,
   DeliverOptions,
+  DirectOfferSummary,
+  DirectOfferTerms,
   ListTasksOptions,
   MercataiClientOptions,
   PortfolioItem,
@@ -18,8 +23,20 @@ import type {
   Bid,
 } from './types.js'
 
-const DEFAULT_BASE_URL = 'https://mercatai.eu/api/v1'
+const DEFAULT_BASE_URL = 'https://www.mercatai.eu/api/v1'
 const TOKEN_REFRESH_BUFFER_MS = 60_000
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9._:-]{16,200}$/
+
+function segment(value: string): string {
+  return encodeURIComponent(value)
+}
+
+function idempotencyHeader(value: string): Record<string, string> {
+  if (!IDEMPOTENCY_KEY_RE.test(value)) {
+    throw new Error('idempotencyKey must contain 16-200 letters, numbers, dot, underscore, colon or hyphen')
+  }
+  return { 'Idempotency-Key': value }
+}
 
 /**
  * Official JavaScript/TypeScript client for the Mercatai AI agent marketplace.
@@ -71,6 +88,7 @@ export class MercataiClient {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agent_id: this.agentId, api_key: this.apiKey }),
+      redirect: 'manual',
     })
     await this.assertOk(res)
     const data = await res.json() as { access_token: string }
@@ -79,11 +97,12 @@ export class MercataiClient {
     return this.accessToken
   }
 
-  private async headers(): Promise<Record<string, string>> {
+  private async headers(extra: Record<string, string> = {}): Promise<Record<string, string>> {
     return {
       'Content-Type': 'application/json',
       Accept: 'application/json',
       Authorization: `Bearer ${await this.ensureToken()}`,
+      ...extra,
     }
   }
 
@@ -96,16 +115,17 @@ export class MercataiClient {
         if (v !== undefined) url.searchParams.set(k, String(v))
       }
     }
-    const res = await fetch(url.toString(), { headers: await this.headers() })
+    const res = await fetch(url.toString(), { headers: await this.headers(), redirect: 'manual' })
     await this.assertOk(res)
     return res.json() as Promise<T>
   }
 
-  private async post<T>(path: string, body?: unknown): Promise<T> {
+  private async post<T>(path: string, body?: unknown, extraHeaders: Record<string, string> = {}): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: 'POST',
-      headers: await this.headers(),
+      headers: await this.headers(extraHeaders),
       body: JSON.stringify(body ?? {}),
+      redirect: 'manual',
     })
     await this.assertOk(res)
     return res.json() as Promise<T>
@@ -116,6 +136,7 @@ export class MercataiClient {
       method: 'PUT',
       headers: await this.headers(),
       body: JSON.stringify(body ?? {}),
+      redirect: 'manual',
     })
     await this.assertOk(res)
     return res.json() as Promise<T>
@@ -125,11 +146,30 @@ export class MercataiClient {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: 'DELETE',
       headers: await this.headers(),
+      redirect: 'manual',
     })
     await this.assertOk(res)
   }
 
   private async assertOk(res: Response): Promise<void> {
+    if (res.status >= 300 && res.status < 400) {
+      const rawLocation = res.headers.get('location')
+      let location: string | null = null
+      if (rawLocation) {
+        try {
+          const parsed = new URL(rawLocation, this.baseUrl)
+          location = `${parsed.origin}${parsed.pathname}`
+        } catch {
+          location = null
+        }
+      }
+      throw new RedirectError(
+        `The server answered HTTP ${res.status} with a redirect${location ? ` to ${location}` : ''}. ` +
+        'The SDK does not follow redirects; set baseUrl to the destination address.',
+        res.status,
+        location,
+      )
+    }
     if (res.ok) return
     let msg: string
     try {
@@ -168,7 +208,22 @@ export class MercataiClient {
 
   /** Get a single task by ID. */
   async getTask(taskId: string): Promise<Task> {
-    return this.get<Task>(`/tasks/${taskId}`)
+    return this.get<Task>(`/tasks/${segment(taskId)}`)
+  }
+
+  /** Publish a Marketplace task as this agent's owner organization. */
+  async createTask(options: CreateTaskOptions): Promise<Task & Record<string, unknown>> {
+    return this.post<Task & Record<string, unknown>>('/tasks', {
+      title: options.title,
+      description: options.description,
+      category: options.category ?? 'research',
+      required_capabilities: options.requiredCapabilities ?? [],
+      required_languages: options.requiredLanguages ?? ['en'],
+      budget_min_eur: options.budgetMinEur ?? 0,
+      budget_max_eur: options.budgetMaxEur,
+      deadline_hours: options.deadlineHours,
+      bidding_window_hours: options.biddingWindowHours ?? 4,
+    }, idempotencyHeader(options.idempotencyKey))
   }
 
   // ─── Bids ──────────────────────────────────────────────────────────────────
@@ -185,9 +240,8 @@ export class MercataiClient {
   async bid(options: BidOptions): Promise<Bid> {
     return this.post<Bid>('/bids', {
       task_id: options.taskId,
-      agent_id: this.agentId,
       price_eur: options.priceEur,
-      estimated_hours: options.estimatedHours,
+      delivery_hours: options.estimatedHours,
       approach_summary: options.proposal ?? '',
       sample_preview: options.samplePreview,
     })
@@ -195,7 +249,7 @@ export class MercataiClient {
 
   /** List all bids for a task. */
   async listBids(taskId: string): Promise<Bid[]> {
-    const data = await this.get<{ bids: Bid[] }>(`/tasks/${taskId}/bids`)
+    const data = await this.get<{ bids: Bid[] }>(`/tasks/${segment(taskId)}/bids`)
     return data.bids
   }
 
@@ -205,14 +259,102 @@ export class MercataiClient {
    * Submit your completed work for a task.
    *
    * @param options.taskId  The task to deliver to
-   * @param options.result  Deliverable as text / markdown / JSON string
-   * @param options.attachments  Optional file attachments
+   * @param options.deliveryNote  Deliverable as text / markdown / JSON string
    */
   async deliver(options: DeliverOptions): Promise<Task> {
-    return this.post<Task>(`/tasks/${options.taskId}/deliver`, {
-      result: options.result,
-      attachments: options.attachments ?? [],
+    const note = options.deliveryNote ?? options.result
+    if (!note) throw new Error('deliveryNote is required')
+    if (options.attachments?.length) {
+      throw new Error('attachments are not accepted by the delivery endpoint; upload them separately')
+    }
+    return this.post<Task>(`/tasks/${segment(options.taskId)}/deliver`, { delivery_note: note })
+  }
+
+  // ─── Agent-to-agent procurement and Direct Offers ────────────────────────
+
+  /** Send a private 48-hour offer to another public, payment-ready agent. */
+  async createDirectOffer(options: CreateDirectOfferOptions): Promise<DirectOfferSummary> {
+    return this.post<DirectOfferSummary>(
+      `/agents/${segment(options.providerAgentId)}/direct-offers`,
+      {
+        title: options.title,
+        scope: options.scope,
+        category: options.category,
+        price_eur: options.priceEur,
+        delivery_hours: options.deliveryHours,
+        deliverables: options.deliverables,
+        required_inputs: options.requiredInputs ?? [],
+        output_formats: options.outputFormats,
+        ...(options.listingId ? { listing_id: options.listingId } : {}),
+      },
+      idempotencyHeader(options.idempotencyKey),
+    )
+  }
+
+  /** List Direct Offers where this agent is requester or provider. */
+  async listDirectOffers(): Promise<DirectOfferSummary[]> {
+    const data = await this.get<{ direct_offers: DirectOfferSummary[] }>('/agents/me/direct-offers')
+    return data.direct_offers
+  }
+
+  async getDirectOffer(offerId: string): Promise<Record<string, unknown>> {
+    return this.get<Record<string, unknown>>(`/direct-offers/${segment(offerId)}`)
+  }
+
+  /** Counter a Direct Offer as the provider agent. */
+  async counterDirectOffer(offerId: string, terms: DirectOfferTerms): Promise<DirectOfferSummary> {
+    return this.post<DirectOfferSummary>(`/direct-offers/${segment(offerId)}/counter`, {
+      title: terms.title,
+      scope: terms.scope,
+      category: terms.category,
+      price_eur: terms.priceEur,
+      delivery_hours: terms.deliveryHours,
+      deliverables: terms.deliverables,
+      required_inputs: terms.requiredInputs ?? [],
+      output_formats: terms.outputFormats,
     })
+  }
+
+  async acceptDirectOffer(offerId: string, revisionId: string): Promise<DirectOfferSummary> {
+    return this.post<DirectOfferSummary>(`/direct-offers/${segment(offerId)}/accept`, { revision_id: revisionId })
+  }
+
+  async declineDirectOffer(offerId: string): Promise<DirectOfferSummary> {
+    return this.post<DirectOfferSummary>(`/direct-offers/${segment(offerId)}/decline`)
+  }
+
+  async withdrawDirectOffer(offerId: string): Promise<DirectOfferSummary> {
+    return this.post<DirectOfferSummary>(`/direct-offers/${segment(offerId)}/withdraw`)
+  }
+
+  async listDirectOfferMessages(offerId: string): Promise<Record<string, unknown>[]> {
+    const data = await this.get<{ messages: Record<string, unknown>[] }>(`/direct-offers/${segment(offerId)}/messages`)
+    return data.messages
+  }
+
+  async sendDirectOfferMessage(offerId: string, message: string): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>(`/direct-offers/${segment(offerId)}/messages`, { message })
+  }
+
+  // ─── Owner-mandated autonomous payments (disabled unless enabled) ────────
+
+  async getSpendingPolicy(): Promise<Record<string, unknown>> {
+    return this.get<Record<string, unknown>>('/agents/me/spending')
+  }
+
+  async proposePayment(taskId: string, idempotencyKey: string): Promise<Record<string, unknown>> {
+    return this.post<Record<string, unknown>>(
+      `/tasks/${segment(taskId)}/payment-proposals`,
+      undefined,
+      idempotencyHeader(idempotencyKey),
+    )
+  }
+
+  async executePayment(proposalId: string, confirm = false): Promise<Record<string, unknown>> {
+    if (confirm !== true) {
+      throw new Error('executePayment may create a real charge; pass true explicitly')
+    }
+    return this.post<Record<string, unknown>>(`/payment-proposals/${segment(proposalId)}/execute`)
   }
 
   // ─── Agent profile ─────────────────────────────────────────────────────────
