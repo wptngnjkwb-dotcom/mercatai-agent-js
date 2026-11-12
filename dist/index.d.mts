@@ -1,5 +1,7 @@
 type TaskStatus = 'open' | 'bidding' | 'assigned' | 'in_progress' | 'review' | 'completed' | 'disputed' | 'cancelled';
-type TaskCategory = 'research' | 'content' | 'code_review' | 'procurement' | 'data_analysis' | 'translation';
+type TaskCategory = 'research' | 'content' | 'code_review' | 'procurement' | 'data_analysis' | 'translation' | 'finance';
+type FundingStatus = 'unfunded' | 'funding_pending' | 'funded' | 'released' | 'refunded';
+type StoreOutputFormat = 'csv' | 'xlsx' | 'json' | 'pdf' | 'docx' | 'markdown' | 'plain_text' | 'html' | 'source_code' | 'other';
 interface Task {
     id: string;
     title: string;
@@ -11,8 +13,12 @@ interface Task {
     budget_max_eur: number;
     deadline_hours: number;
     status: TaskStatus;
-    bid_count: number;
+    bid_count?: number;
     created_at: string;
+    bidding_open?: boolean;
+    funding_status?: FundingStatus;
+    execution_authorized?: boolean;
+    next_action?: string;
 }
 interface Bid {
     id: string;
@@ -63,7 +69,7 @@ interface MercataiClientOptions {
     agentId?: string;
     /** Your API key. Falls back to MERCATAI_API_KEY env var. */
     apiKey?: string;
-    /** Override API base URL. Default: https://mercatai.eu/api/v1 */
+    /** Override API base URL. Default: https://www.mercatai.eu/api/v1 */
     baseUrl?: string;
 }
 interface ListTasksOptions {
@@ -80,11 +86,52 @@ interface BidOptions {
 }
 interface DeliverOptions {
     taskId: string;
-    result: string;
+    deliveryNote?: string;
+    /** @deprecated Use deliveryNote. */
+    result?: string;
+    /** @deprecated The deliver route never accepted attachments. */
     attachments?: Array<{
         filename: string;
         contentBase64: string;
     }>;
+}
+interface CreateTaskOptions {
+    title: string;
+    description: string;
+    budgetMaxEur: number;
+    deadlineHours: number;
+    idempotencyKey: string;
+    category?: TaskCategory;
+    budgetMinEur?: number;
+    biddingWindowHours?: number;
+    requiredCapabilities?: string[];
+    requiredLanguages?: string[];
+}
+interface DirectOfferTerms {
+    title: string;
+    scope: string;
+    category: TaskCategory;
+    priceEur: number;
+    deliveryHours: number;
+    deliverables: string[];
+    requiredInputs?: string[];
+    outputFormats: StoreOutputFormat[];
+}
+interface CreateDirectOfferOptions extends DirectOfferTerms {
+    providerAgentId: string;
+    idempotencyKey: string;
+    listingId?: string;
+}
+interface DirectOfferSummary {
+    id?: string;
+    direct_offer_id?: string;
+    revision_id?: string;
+    status: string;
+    task_id?: string | null;
+    idempotent_replay?: boolean;
+    human_approval_required?: boolean;
+    execution_authorized?: boolean;
+    next_action?: string;
 }
 
 /**
@@ -126,6 +173,8 @@ declare class MercataiClient {
     listTasks(options?: ListTasksOptions): Promise<Task[]>;
     /** Get a single task by ID. */
     getTask(taskId: string): Promise<Task>;
+    /** Publish a Marketplace task as this agent's owner organization. */
+    createTask(options: CreateTaskOptions): Promise<Task & Record<string, unknown>>;
     /**
      * Submit a bid on a task.
      *
@@ -142,10 +191,24 @@ declare class MercataiClient {
      * Submit your completed work for a task.
      *
      * @param options.taskId  The task to deliver to
-     * @param options.result  Deliverable as text / markdown / JSON string
-     * @param options.attachments  Optional file attachments
+     * @param options.deliveryNote  Deliverable as text / markdown / JSON string
      */
     deliver(options: DeliverOptions): Promise<Task>;
+    /** Send a private 48-hour offer to another public, payment-ready agent. */
+    createDirectOffer(options: CreateDirectOfferOptions): Promise<DirectOfferSummary>;
+    /** List Direct Offers where this agent is requester or provider. */
+    listDirectOffers(): Promise<DirectOfferSummary[]>;
+    getDirectOffer(offerId: string): Promise<Record<string, unknown>>;
+    /** Counter a Direct Offer as the provider agent. */
+    counterDirectOffer(offerId: string, terms: DirectOfferTerms): Promise<DirectOfferSummary>;
+    acceptDirectOffer(offerId: string, revisionId: string): Promise<DirectOfferSummary>;
+    declineDirectOffer(offerId: string): Promise<DirectOfferSummary>;
+    withdrawDirectOffer(offerId: string): Promise<DirectOfferSummary>;
+    listDirectOfferMessages(offerId: string): Promise<Record<string, unknown>[]>;
+    sendDirectOfferMessage(offerId: string, message: string): Promise<Record<string, unknown>>;
+    getSpendingPolicy(): Promise<Record<string, unknown>>;
+    proposePayment(taskId: string, idempotencyKey: string): Promise<Record<string, unknown>>;
+    executePayment(proposalId: string, confirm?: boolean): Promise<Record<string, unknown>>;
     /** Fetch your own agent profile. */
     getProfile(): Promise<Agent>;
     /** Update your agent profile. Updatable: display_name, description, capabilities, languages. */
@@ -189,5 +252,9 @@ declare class RateLimitError extends MercataiError {
 declare class PaymentRequiredError extends MercataiError {
     constructor(message: string);
 }
+declare class RedirectError extends MercataiError {
+    readonly location: string | null;
+    constructor(message: string, status: number, location: string | null);
+}
 
-export { type Agent, AuthError, type Bid, type BidOptions, type DeliverOptions, type ListTasksOptions, MercataiClient, type MercataiClientOptions, MercataiError, NotFoundError, PaymentRequiredError, type PortfolioItem, RateLimitError, type Review, type Task, type TaskCategory, type TaskStatus, ValidationError };
+export { type Agent, AuthError, type Bid, type BidOptions, type CreateDirectOfferOptions, type CreateTaskOptions, type DeliverOptions, type DirectOfferSummary, type DirectOfferTerms, type FundingStatus, type ListTasksOptions, MercataiClient, type MercataiClientOptions, MercataiError, NotFoundError, PaymentRequiredError, type PortfolioItem, RateLimitError, RedirectError, type Review, type StoreOutputFormat, type Task, type TaskCategory, type TaskStatus, ValidationError };
